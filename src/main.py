@@ -39,38 +39,68 @@ theme = Theme({
 })
 
 class RichLogger:
-    def __init__(self, name: str = "app"):
+    def __init__(self, name: str = "app", log_dir: str = "logs"):
         # Initialize rich console
         self.console = Console(theme=theme)
         install_rich_traceback()
         
-        # Set up basic logging
-        self.log_path = Path("logs")
+        # Set up log directory
+        self.log_path = Path(log_dir)
         self.log_path.mkdir(exist_ok=True)
         
         # Create logger
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
         
-        # Add file handler
-        fh = logging.FileHandler(self.log_path / f"{name}.log")
+        # Remove any existing handlers
+        self.logger.handlers = []
+        
+        # Create file handler with timestamp
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = self.log_path / f"{name}.log"
+        
+        # Add file handler with formatter
+        fh = logging.FileHandler(log_file, encoding='utf-8')
         fh.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        fh.setFormatter(formatter)
         self.logger.addHandler(fh)
+        
+        # Keep track of the current log file
+        self.current_log_file = log_file
+        
+        self.info(f"Logging initialized. Log file: {log_file}")
+
+    def _format_for_file(self, data: Any) -> str:
+        """Format data for file logging"""
+        if isinstance(data, dict):
+            return json.dumps(data, indent=2, default=str)
+        return str(data)
 
     def print_json(self, data: Any, title: Optional[str] = None):
         """Pretty print JSON-serializable data"""
         if title:
             self.console.print(f"\n[bold]{title}[/bold]")
             self.console.print("─" * 40)
+            self.logger.info(f"=== {title} ===")
         
         try:
-            # Try to make it JSON-serializable first
+            # Console output
             json_str = json.dumps(data, indent=2, default=str)
             parsed = json.loads(json_str)
             pprint(parsed, expand_all=True)
+            
+            # File output
+            self.logger.info(f"\n{json_str}")
         except Exception as e:
-            self.console.print(f"[error]Error formatting data: {str(e)}[/error]")
-            pprint(data)  # Fallback to regular pretty print
+            error_msg = f"Error formatting data: {str(e)}"
+            self.console.print(f"[error]{error_msg}[/error]")
+            self.logger.error(error_msg)
+            # Fallback to string representation for file
+            self.logger.info(str(data))
 
     def info(self, message: str):
         """Log info message"""
@@ -95,17 +125,30 @@ class RichLogger:
     def highlight(self, message: str):
         """Print highlighted message"""
         self.console.print(f"[highlight]{message}[/highlight]")
+        self.logger.info(f"HIGHLIGHT: {message}")
 
     def section(self, title: str):
         """Print section header"""
         self.console.rule(f"[bold]{title}")
+        self.logger.info(f"\n{'='*50}\n{title}\n{'='*50}")
 
     def dict(self, data: dict, title: Optional[str] = None):
         """Pretty print dictionary data"""
         if title:
             self.console.print(f"\n[bold]{title}[/bold]")
             self.console.print("─" * 40)
+            self.logger.info(f"\n=== {title} ===")
+        
+        # Console output
         pprint(data, expand_all=True)
+        
+        # File output - format dictionary as JSON string
+        formatted_data = self._format_for_file(data)
+        self.logger.info(f"\n{formatted_data}")
+
+    def get_log_file(self) -> Path:
+        """Get the current log file path"""
+        return self.current_log_file
 
 
 def load_file_contents(file_paths: List[str]) -> dict:
@@ -232,9 +275,13 @@ class PipelineState(TypedDict):
     response: str
     active_agent: str
     file_contents: dict
+    planner_feedback: str
 
 class Plan(BaseModel):
     steps: List[str] = Field(description="Numbered unique steps to complete the development task, in order")
+
+class Feedback(BaseModel):
+    message: str = Field(description="Feedback message from the planner")
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # setting up the planning...
@@ -253,46 +300,56 @@ Provide a step-by-step plan.
 
 You've already completed the following steps:
 {past_steps}
-
-If necessary update your plan accordingly, but if is not necessary just continue with the next step.
 """
 
-CODE_AGENT_PROMPT = """You are a Next.js 14 and TypeScript expert. Write high-quality code.
-Current step: {current_step}
-Related file contents: {relevant_content}
+# CODE_AGENT_PROMPT = """You are a Next.js 14 and TypeScript expert. Write high-quality code.
+# Current step: {current_step}
+# Related file contents: {relevant_content}
 
-Write code following:
-1. Next.js 14 conventions (app router, server components, etc.)
-2. TypeScript best practices
-3. React patterns and hooks
-4. Clean code principles
+# Write code following:
+# 1. Next.js 14 conventions (app router, server components, etc.)
+# 2. TypeScript best practices
+# 3. React patterns and hooks
+# 4. Clean code principles
 
-Relevant context from vector store:
-{context}"""
-
+# Planner feedback: {planner_feedback}
+# """
 
 async def plan_step(state: PipelineState):
     """Create development plan"""
     logger.section("reasoning")
     logger.dict(state, "state")
     #
-    if state["current_plan"]:
+    if (len(state["current_plan"]) == 0) and (len(state["past_steps"]) == 0):
+        planning_chain = ChatPromptTemplate.from_template(PLANNER_PROMPT) | llm_gpt_4o_mini.with_structured_output(Plan)
+        plan = await planning_chain.ainvoke({
+            "input": state["messages"][-1].content,
+            "file_paths": list(state["file_contents"].keys()),
+            "past_steps": state["past_steps"]
+        })
         return {
-            "active_agent": "code_agent",
-            "current_plan": state["current_plan"]
+            "current_plan": plan.steps,
+            "active_agent": "code_agent"
         }
-    planning_chain = ChatPromptTemplate.from_template(PLANNER_PROMPT) | llm_gpt_4o_mini.with_structured_output(Plan)
-    plan = await planning_chain.ainvoke({
-        "input": state["messages"][-1].content,
-        "file_paths": list(state["file_contents"].keys()),
-        "past_steps": state["past_steps"]
-    })
-    if not plan.steps:
-        return {"active_agent": "FINISH"}
-    return {
-        "current_plan": plan.steps,
-        "active_agent": "code_agent"
-    }
+    elif len(state["past_steps"]) > 0:
+        planning_chain = ChatPromptTemplate.from_template(PLANNER_PROMPT) | llm_gpt_4o_mini.with_structured_output(Feedback)
+        plan = await planning_chain.ainvoke({
+            "input": f"""Evaluate the coherence between the user's query and the already completed steps.\n\nUSER QUERY: {state["messages"][-1].content}""",
+            "file_paths": list(state["file_contents"].keys()),
+            "past_steps": state["past_steps"]
+        })
+        return {
+            "planner_feedback": plan.message,
+            "active_agent": "code_agent"
+        }
+
+
+def should_end(state: PipelineState):
+    if (len(state["current_plan"]) == 0) and (len(state["past_steps"]) > 0): 
+        return END
+    else:
+        return "code_agent"
+
 
 async def code_agent_step(state: PipelineState):
     """Generate Next.js/TypeScript code"""
@@ -304,13 +361,18 @@ async def code_agent_step(state: PipelineState):
         [f"{i+1}. {step}" for i, step in enumerate(state["current_plan"])]
     )
     # rag
-    relevant_docs = vector_store.similarity_search(current_step_str, k=3)
+    relevant_docs = vector_store.similarity_search(current_step_str, k=1)
     context = "\n".join(doc.page_content for doc in relevant_docs)
     task = current_step[0]
     task_str = f"""
+    You are a Next.js 14 and TypeScript expert. Write high-quality code.
+
     For the following plan: {current_step_str} You are currently working on: {task}
+
     Below there is some context from the vector store that might help you to write the code:
     {context}
+
+    Below there is the feedback from the planner: {state["planner_feedback"]}
     """
     logger.info(task_str)
     #
@@ -332,23 +394,9 @@ workflow.add_node("planner", plan_step)
 workflow.add_node("code_agent", code_agent_step)
 # adding edges...
 workflow.add_edge(START, "planner")
+workflow.add_edge("code_agent", "planner")
 # adding conditional edges...
-workflow.add_conditional_edges(
-    "planner",
-    lambda x: x["active_agent"],
-    {
-        "code_agent": "code_agent",
-        "FINISH": END
-    }
-)
-workflow.add_conditional_edges(
-    "code_agent",
-    lambda x: x["active_agent"],
-    {
-        "planner": "planner",
-        # "FINISH": END
-    }
-)
+workflow.add_conditional_edges("planner", should_end, ["code_agent", END])
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # compiling the workflow and displaying the graph...
@@ -374,6 +422,7 @@ async def run_pipeline(query: str, file_paths: List[str]):
         "execution_history": list(),
         "active_agent": "planner",
         "file_contents": file_contents,
+        "planner_feedback" : ""
     }
     print("running pipeline...")
     async for event in app.astream(initial_state):
@@ -387,7 +436,6 @@ async def run_pipeline(query: str, file_paths: List[str]):
 if __name__ == "__main__":
     query = """
     Does the code below have any issues?
-
     ```tsx
     // app/settings/page.tsx
     'use client';
