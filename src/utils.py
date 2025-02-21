@@ -6,6 +6,7 @@ from rich.theme import Theme
 from rich.traceback import install as install_rich_traceback
 from rich.pretty import pprint
 import json
+import tiktoken
 from pathlib import Path
 import logging
 
@@ -145,3 +146,8 @@ def display_graph(graph, output_folder="output", file_name="graph"):
     filename = os.path.join(output_folder, "graph.png")
     with open(filename, 'wb') as f:
         f.write(mermaid_png)
+
+def tokens_from_string(string: str) -> int:
+    """Return the number of tokens in a string."""
+    encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(string))

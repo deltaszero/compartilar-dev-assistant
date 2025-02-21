@@ -32,6 +32,24 @@ load_dotenv("../credentials.env")
 
 logger = RichLogger("pipeline")
 
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# initializing the vector store...
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+PERSIST_DIRECTORY = "/home/dusoudeth/Documentos/github/compartilar-dev-assistant/db/vector_store"
+# # remove existing vector store
+# if os.path.exists(PERSIST_DIRECTORY):
+#     os.system(f"rm -rf {PERSIST_DIRECTORY}")
+
+embeddings = OpenAIEmbeddings(
+    # model="text-embedding-ada-002",
+    model="text-embedding-3-small",
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+vector_store = Chroma(
+    persist_directory=PERSIST_DIRECTORY,
+    embedding_function=embeddings
+)
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # tools...
@@ -42,24 +60,80 @@ def tokens_from_string(string: str) -> int:
     encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(string))
 
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-# initializing the vector store...
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-PERSIST_DIRECTORY = "/home/dusoudeth/Documentos/github/compartilar-dev-assistant/db/vector_store"
-# remove existing vector store
-if os.path.exists(PERSIST_DIRECTORY):
-    os.system(f"rm -rf {PERSIST_DIRECTORY}")
-
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_key=os.getenv("OPENAI_API_KEY")
-)
-
-vector_store = Chroma(
-    persist_directory=PERSIST_DIRECTORY,
-    embedding_function=embeddings
-)
+def load_file_contents(file_paths: List[str], vector_store: Chroma, overwrite: bool = False) -> dict:
+    logger = RichLogger("utils")
+    file_contents = {}
+    all_splits = []
+    
+    for path in file_paths:
+        if not os.path.exists(path):
+            logger.warning(f"File not found: {path}")
+            continue
+        # query to check if `path` is already in the vector store
+        metadata = vector_store.get(
+            # limit = 1,
+            where = {"source" : {"$eq" : path}}
+        )
+        existing_metadata = len(metadata["metadatas"]) > 0
+        print(metadata["metadatas"])
+        if existing_metadata and not overwrite:
+            logger.warning(f"File already loaded: {path}")
+            continue
+        try:
+            file_extension = Path(path).suffix.lower()
+            documents = []
+            # pdf
+            if file_extension == '.pdf':
+                logger.info(f"Loading PDF file: {path}")
+                loader = PyPDFLoader(path)
+                documents = loader.load()
+            # docx or doc
+            elif file_extension in ['.docx', '.doc']:
+                logger.info(f"Loading Word document: {path}")
+                loader = Docx2txtLoader(path)
+                documents = loader.load()
+            # other, mainly text files
+            else:
+                logger.info(f"Loading text file: {path}")
+                loader = TextLoader(path)
+                documents = loader.load()
+            # combining all pages into a single string...
+            file_contents[path] = "\n".join(doc.page_content for doc in documents)
+            # splitting documents...
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size = 4098,
+                chunk_overlap = 256,
+                length_function = len,
+                is_separator_regex = False,
+            )
+            splits = text_splitter.split_documents(documents)
+            # addding page numbers and source to metadata...
+            for i, split_doc in enumerate(splits):
+                original_page = split_doc.metadata.get('page', None)
+                if original_page is not None:
+                    split_doc.metadata['page_number'] = original_page
+                else:
+                    split_doc.metadata['page_number'] = i
+                split_doc.metadata['source'] = path
+            # adding all splits to the list...
+            all_splits.extend(splits)
+            # calculate tokens per chunk
+            tokens_per_chunk = [tokens_from_string(doc.page_content) for doc in splits]
+            logger.info(f"Tokens per chunk: {tokens_per_chunk}")
+            logger.success(f"Successfully processed: {path}")
+        except Exception as e:
+            logger.error(f"Error loading {path}: {str(e)}")
+            continue
+    # adding all documents to vector store at once...
+    if all_splits:
+        vector_store.add_documents(all_splits)
+    logger.section("File Loading Summary")
+    logger.dict({
+        "total_files": len(file_paths),
+        "processed_files": len(file_contents),
+        "processed_paths": list(file_contents.keys())
+    })
+    return file_contents
 
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -133,16 +207,30 @@ workflow.add_edge("process_input", END)
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # compiling the workflow and displaying the graph...
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-app = workflow.compile()
+app = workflow.compile(checkpointer=MemorySaver(), store=in_memory_store)
 
 display_graph(app)
 
 
-def run_workflow(query: dict):
+def run_workflow(
+        query: dict,
+        file_paths: List[str] = list(),
+        vector_store: Chroma = vector_store
+    ):
     initial_state = {
         "messages": [HumanMessage(content=query)],
-    }    
-    for event in app.stream(initial_state, config={"recursion_limit": 250}):
+    }
+    config = {
+        "recursion_limit" : 256,
+        "thread_id" : "session_test",
+        "user_id" : "thiagodsd"
+    }
+    vector_store = load_file_contents(
+        file_paths,
+        vector_store,
+        False
+    )
+    for event in app.stream(initial_state, config=config):
         if "__end__" not in event:
             if "process_input" in event:
                 print(event["process_input"]["output"])
@@ -150,6 +238,17 @@ def run_workflow(query: dict):
 
 if __name__ == "__main__":
     query = """
-    What is the best way to install a new package in Python?
+    What is my name?
     """
-    run_workflow(query)
+    run_workflow(
+        query,
+        [
+            "/home/dusoudeth/Documentos/github/compartilar/app/components/friendship/FriendList.tsx",
+            "/home/dusoudeth/Documentos/github/compartilar/.firestore-rules",
+            "/home/dusoudeth/Documentos/github/compartilar/.storage-rules",
+            "/home/dusoudeth/Documentos/github/compartilar/types/friendship.types.ts",
+            "/home/dusoudeth/Documentos/github/compartilar/app/components/friendship/FriendSearch.tsx",
+            "/home/dusoudeth/Documentos/github/compartilar/app/components/friendship/FriendRequests.tsx",
+        ],
+        vector_store
+    )
