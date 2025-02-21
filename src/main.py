@@ -3,6 +3,7 @@ import os
 import random
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Annotated, List, Tuple, TypedDict
 
@@ -50,6 +51,13 @@ vector_store = Chroma(
     persist_directory=PERSIST_DIRECTORY,
     embedding_function=embeddings
 )
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# memories...
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+in_memory_store = InMemoryStore()
+
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # tools...
@@ -136,10 +144,26 @@ def load_file_contents(file_paths: List[str], vector_store: Chroma, overwrite: b
     return file_contents
 
 
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-# memories...
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-in_memory_store = InMemoryStore()
+def put_info_into_memory(content:dict, config, *, memory):
+    user_id = config["user_id"]
+    namespace = (user_id, "memories")
+    memory_id = str(uuid.uuid4())
+    memory.put(
+        namespace,
+        memory_id,
+        content
+    )
+    return {"messages": ["User information saved."]}
+
+
+def get_info_from_memory(query, config, *, memory):
+    user_id = config["user_id"]
+    namespace = (user_id, "memories")
+    memories = memory.search(
+        namespace,
+        query
+    )
+    return {"messages": memories}
 
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -147,6 +171,7 @@ in_memory_store = InMemoryStore()
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 class PipelineState(TypedDict):
     messages: List[HumanMessage]
+    username: str
     output: str
 
 class TextualResponse(BaseModel):
@@ -222,8 +247,10 @@ def run_workflow(
     }
     config = {
         "recursion_limit" : 256,
-        "thread_id" : "session_test",
-        "user_id" : "thiagodsd"
+        "configurable" : {
+            "thread_id" : "session_test",
+            "user_id" : "thiagodsd"
+        }
     }
     vector_store = load_file_contents(
         file_paths,
